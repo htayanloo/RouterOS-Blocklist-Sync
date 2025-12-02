@@ -15,14 +15,15 @@ import (
 )
 
 type Config struct {
-	MtHost     string
-	MtUser     string
-	MtPass     string
-	ListTemp   string
-	ListPerm   string
-	Whitelist  []string
-	StateFile  string
-	Escalation []int
+	MtHost       string
+	MtUser       string
+	MtPass       string
+	ListTemp     string
+	ListPerm     string
+	Whitelist    []string
+	StateFile    string
+	Escalation   []int
+	FinalTimeout string // "0" for permanent, or "24:00:00" for 24h, etc.
 }
 
 // ----------------------------------------------
@@ -84,6 +85,9 @@ STATE_FILE=/opt/htb_blocker/state.json
 ESCALATE_1=1
 ESCALATE_2=3
 ESCALATE_3=7
+
+# Final timeout: "0" for permanent, or "24:00:00" for 24 hours, etc.
+FINAL_TIMEOUT=24:00:00
 `
 		os.WriteFile(configPath, []byte(defaultCfg), 0644)
 
@@ -153,6 +157,8 @@ func loadConfig(path string) (*Config, error) {
 		case "ESCALATE_1", "ESCALATE_2", "ESCALATE_3":
 			h, _ := strconv.Atoi(val)
 			cfg.Escalation = append(cfg.Escalation, h)
+		case "FINAL_TIMEOUT":
+			cfg.FinalTimeout = val
 		}
 	}
 
@@ -243,6 +249,20 @@ func getTimeout(count int, hours []int) string {
 
 // ----------------------------------------------
 
+func isIPInList(client *routeros.Client, listName, ip string) bool {
+	reply, err := client.RunArgs([]string{
+		"/ip/firewall/address-list/print",
+		"?list=" + listName,
+		"?address=" + ip,
+	})
+	if err != nil {
+		return false
+	}
+	return len(reply.Re) > 0
+}
+
+// ----------------------------------------------
+
 func main() {
 
 	if len(os.Args) < 2 {
@@ -261,6 +281,11 @@ func main() {
 	cfg, err := loadConfig(filepath.Join(baseDir, "config.env"))
 	if err != nil {
 		log.Fatalf("Config load error: %v", err)
+	}
+
+	// Default to 24 hours if not set
+	if cfg.FinalTimeout == "" {
+		cfg.FinalTimeout = "24:00:00"
 	}
 
 	state, _ := loadState(cfg.StateFile)
@@ -291,25 +316,35 @@ func main() {
 			continue
 		}
 
-		// --- 3) State update ---
+		// --- 3) Check if already blocked (don't increment counter) ---
+		if isIPInList(client, cfg.ListTemp, ip) {
+			log.Printf("⏳ %s → Already blocked (counter not incremented)", ip)
+			continue
+		}
+
+		// --- 4) State update ---
 		state[ip]++
 		timeout := getTimeout(state[ip], cfg.Escalation)
 
-		// --- 4) Permanent block ---
+		// --- 5) Final escalation block ---
 		if timeout == "0" {
-			log.Printf("🚫 %s → Permanent block", ip)
+			blockType := "permanent"
+			if cfg.FinalTimeout != "0" {
+				blockType = cfg.FinalTimeout
+			}
+			log.Printf("🚫 %s → Final block (%s)", ip, blockType)
 
 			_, _ = client.RunArgs([]string{
 				"/ip/firewall/address-list/add",
 				"=list=" + cfg.ListPerm,
 				"=address=" + ip,
-				"=timeout=0",
+				"=timeout=" + cfg.FinalTimeout,
 			})
 
 			continue
 		}
 
-		// --- 5) Temporary (escalated) block ---
+		// --- 6) Temporary (escalated) block ---
 		log.Printf("🛡️ %s → attempt %d → timeout %s", ip, state[ip], timeout)
 
 		_, err := client.RunArgs([]string{

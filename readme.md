@@ -4,33 +4,54 @@ A Go-based security automation tool that automatically blocks attacker IPs on Mi
 
 ## Overview
 
-This tool reads a CSV file containing attacker IP addresses (typically exported from Splunk or honeypot logs) and automatically adds them to MikroTik firewall address lists. It implements a smart escalation mechanism where repeat offenders receive progressively longer blocking periods, culminating in permanent blocks.
+This tool reads a CSV file containing attacker IP addresses (typically exported from Splunk or honeypot logs) and automatically adds them to MikroTik firewall address lists. It implements a smart escalation mechanism where repeat offenders receive progressively longer blocking periods, culminating in configurable final blocks.
+
+**New in v2.0**: Smart duplicate prevention ensures overlapping time windows don't inflate offense counts. When running frequent queries (e.g., every 5 minutes with 15-minute lookbacks), the same attack won't be counted multiple times.
 
 ### Key Features
 
 - **Automatic IP Blocking**: Seamlessly integrates with MikroTik routers via API
-- **Progressive Escalation**: Repeat attackers get longer timeouts (1h → 3h → 7h → permanent)
+- **Progressive Escalation**: Repeat attackers get longer timeouts (1h → 3h → 7h → configurable final)
+- **Smart Duplicate Prevention**: Only counts new attacks, not overlapping time windows
 - **State Persistence**: Tracks attack history across runs to identify repeat offenders
 - **Whitelist Support**: Protect legitimate IPs and networks from being blocked
 - **Dual-List Strategy**: Separate temporary and permanent block lists
+- **Configurable Final Block**: Choose permanent or time-based final escalation (24h, 48h, etc.)
 - **Auto-Setup**: Interactive setup creates necessary directories and default configuration
 - **Cron-Friendly**: Designed for automated periodic execution
 
 ## How It Works
 
 ```
-CSV Input → IP Extraction → Whitelist Check → State Tracking → Escalation Policy → MikroTik API
+CSV Input → IP Extraction → Whitelist Check → Duplicate Check → State Tracking → Escalation Policy → MikroTik API
 ```
 
 1. **CSV Parsing**: Reads attacker IPs from CSV file (skips header row)
 2. **Whitelist Validation**: Checks if IP is in whitelist (supports CIDR notation)
-3. **State Tracking**: Increments offense counter for each IP
-4. **Escalation Logic**:
+3. **Duplicate Prevention**: Checks if IP is already blocked in temporary list
+   - If already blocked → Skip (counter not incremented)
+   - This prevents overlapping time windows from inflating offense counts
+4. **State Tracking**: Increments offense counter only for new/expired blocks
+5. **Escalation Logic**:
    - 1st offense: 1 hour timeout
    - 2nd offense: 3 hours timeout
    - 3rd offense: 7 hours timeout
-   - 4th+ offense: Permanent block
-5. **MikroTik Blocking**: Adds IP to appropriate address list with calculated timeout
+   - 4th+ offense: Configurable final block (default 24 hours, or permanent)
+6. **MikroTik Blocking**: Adds IP to appropriate address list with calculated timeout
+
+### Smart Duplicate Prevention
+
+When running frequent queries (e.g., every 5 minutes with 15-minute lookback windows), the same attack can appear in multiple CSV exports. The tool intelligently handles this:
+
+**Example Timeline:**
+```
+10:00 → IP attacks → Blocked 1 hour (offense #1)
+10:05 → IP in CSV again → Already blocked, SKIPPED (still offense #1)
+10:10 → IP in CSV again → Already blocked, SKIPPED (still offense #1)
+11:05 → Block expired, IP attacks again → Blocked 3 hours (offense #2)
+```
+
+This ensures **only real repeat attacks** increment the counter, not query overlaps.
 
 ## Installation
 
@@ -86,7 +107,21 @@ STATE_FILE=/opt/htb_blocker/state.json
 ESCALATE_1=1                        # First offense timeout
 ESCALATE_2=3                        # Second offense timeout
 ESCALATE_3=7                        # Third offense timeout
+
+# Final timeout (after 4th offense)
+FINAL_TIMEOUT=24:00:00              # Options: "0" for permanent, or "HH:MM:SS" format
+                                     # Examples: "24:00:00" (24h), "48:00:00" (48h), "168:00:00" (7 days)
 ```
+
+### Final Timeout Options
+
+The `FINAL_TIMEOUT` parameter controls what happens on the 4th offense:
+
+- **`FINAL_TIMEOUT=0`** → Permanent block (never expires)
+- **`FINAL_TIMEOUT=24:00:00`** → 24-hour block (default)
+- **`FINAL_TIMEOUT=48:00:00`** → 48-hour block
+- **`FINAL_TIMEOUT=168:00:00`** → 7-day block
+- Any custom duration in `HH:MM:SS` format
 
 ### MikroTik Router Setup
 
@@ -142,11 +177,14 @@ Add to crontab for periodic blocking (every 5 minutes):
 The tool provides emoji-coded status messages:
 
 ```
-⚪ 192.168.1.100 → SKIP           # Whitelisted IP
-🛡️ 203.0.113.25 → attempt 1 → timeout 01:00:00    # First offense
-🛡️ 198.51.100.50 → attempt 2 → timeout 03:00:00   # Second offense
-🚫 192.0.2.100 → Permanent block  # Fourth+ offense
-❌ Block failed for X.X.X.X: error message         # Error occurred
+⚪ 192.168.1.100 → SKIP (whitelisted)                    # Whitelisted IP
+⏳ 203.0.113.25 → Already blocked (counter not incremented)  # Already blocked, skipped
+🛡️ 203.0.113.25 → attempt 1 → timeout 01:00:00          # First offense
+🛡️ 198.51.100.50 → attempt 2 → timeout 03:00:00         # Second offense
+🛡️ 198.51.100.50 → attempt 3 → timeout 07:00:00         # Third offense
+🚫 192.0.2.100 → Final block (24:00:00)                   # Fourth offense (24h default)
+🚫 192.0.2.100 → Final block (permanent)                  # Fourth offense (if FINAL_TIMEOUT=0)
+❌ Block failed for X.X.X.X: error message                # Error occurred
 ```
 
 ## State File
@@ -169,7 +207,7 @@ This tracks how many times each IP has been seen, enabling the escalation mechan
 
 1. **Splunk Search**: Create search to identify attackers
    ```spl
-   index=honeypot action=attack
+   index=honeypot action=attack earliest=-15m
    | stats count by src_ip
    | where count > 5
    | table src_ip
@@ -178,8 +216,28 @@ This tracks how many times each IP has been seen, enabling the escalation mechan
 2. **Export to CSV**: Schedule report to export results to CSV
 
 3. **Cron Job**: Run blocker periodically against exported CSV
+   ```bash
+   */5 * * * * /opt/htb_blocker/blocker /path/to/attackers.csv
+   ```
 
 4. **MikroTik**: Automatically blocks identified attackers
+
+### Handling Overlapping Time Windows
+
+If your Splunk query runs every 5 minutes but looks back 15 minutes, the same attack will appear in 3 consecutive CSV exports. **This is not a problem** - the tool's duplicate prevention will handle it:
+
+**Example:**
+```
+Splunk Query: earliest=-15m (15-minute lookback)
+Cron: */5 * * * * (every 5 minutes)
+
+10:00 query → Finds attack at 09:55 → IP blocked 1 hour
+10:05 query → Still sees attack at 09:55 → IP already blocked, SKIP
+10:10 query → Still sees attack at 09:55 → IP already blocked, SKIP
+10:15 query → Attack no longer in window
+```
+
+The counter stays at 1 because the tool checks if the IP is already blocked before incrementing.
 
 ## Security Considerations
 
@@ -217,6 +275,22 @@ Mikrotik error: authentication failed
 - Check for extra spaces in config.env
 - Verify IP parsing with manual test
 
+### IPs Getting Permanently Blocked Too Quickly
+
+If IPs are reaching permanent/final blocks after appearing only once:
+
+**Cause**: Overlapping time windows causing duplicate counting
+
+**Solution**: The tool now includes automatic duplicate prevention (v2.0+). Check logs for:
+```
+⏳ 192.0.2.100 → Already blocked (counter not incremented)
+```
+
+If you don't see this message, ensure:
+1. You're using the latest version with duplicate prevention
+2. The `LIST_TEMP` in config.env matches your actual MikroTik list name
+3. The tool can successfully query MikroTik API (check connection)
+
 ## Project Structure
 
 ```
@@ -245,11 +319,13 @@ This is a security automation tool. Use responsibly and ensure you have proper a
 Contributions are welcome! Areas for improvement:
 
 - Support for IPv6 addresses
-- Database backend for state tracking
-- Web dashboard for monitoring
-- Multi-router support
-- Email/webhook notifications
+- Database backend for state tracking (currently uses JSON)
+- Web dashboard for monitoring blocked IPs and statistics
+- Multi-router support (currently single router)
+- Email/webhook notifications on permanent blocks
 - Custom escalation policies per IP range
+- GeoIP integration for geographic-based policies
+- Integration with other SIEM platforms (currently optimized for Splunk)
 
 ## Author
 
